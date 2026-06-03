@@ -18,7 +18,7 @@ ckpts_dir="./outputs/${project_name}/${experiment_name}"
 mkdir -p "${ckpts_dir}/logs"
 
 # Trainig setting
-NGPUS=8
+NGPUS=4
 train_prompt_bsz=512
 train_prompt_mini_bsz=128
 

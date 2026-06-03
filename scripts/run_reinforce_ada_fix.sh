@@ -11,7 +11,7 @@ model_name=Qwen2.5-Math-1.5B
 
 # Wandb setting
 project_name=Reinforce-Ada
-exp_name=Reinforce-Ada_${model_name}
+exp_name=Reinforce-Ada_fix_${model_name}
 
 # Output
 ckpts_dir="./outputs/${project_name}/${exp_name}"
@@ -57,7 +57,7 @@ multiround_adaptive_downsampling=True
 reinforce_ada_choice="balanced" # "positive_focused" or "balanced"
 global_stat_est=True
 norm_adv_by_std_in_grpo=False
-correct_bias=False
+correct_bias=True
 
 # Training data
 train_path=./data/openr1/train.parquet

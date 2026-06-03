@@ -258,6 +258,36 @@ def compute_gae_advantage_return(
 
 
 # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+
+
+def _grpo_kept_batch_pos_neg_ratio(n_pos: int, n_neg: int) -> float:
+    """Pos/neg ratio s in the kept batch for one prompt (not the positive fraction)."""
+    if n_neg == 0:
+        return float("inf")
+    return n_pos / n_neg
+
+
+def _grpo_corrected_advantages(p: float, s: float) -> tuple[float, float]:
+    """Return (adv_pos, adv_neg) for stratified downsampling correction.
+
+    The correction keeps positive signal gentler when the prompt is hard:
+      - if p <= 1/2: positive = 1 - p^2 / (1 - p), negative = -p * s
+      - if p >  1/2: positive = 1 - p, negative = -(1 - p) * s
+
+    Here p is the full-pool positive probability and s is the kept-batch
+    pos/neg ratio.
+    """
+    if p <= 0.5:
+        adv_pos = 1.0 - (p * p) / max(1.0 - p, 1e-12)
+        neg_scale = p
+    else:
+        adv_pos = 1.0 - p
+        neg_scale = 1.0 - p
+
+    adv_neg = -neg_scale * s if np.isfinite(s) else 0.0
+    return adv_pos, adv_neg
+
+
 @register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
@@ -290,6 +320,10 @@ def compute_grpo_outcome_advantage(
             mapping from uid to number of positive samples before downsampling
         grpo_uid_to_neg_count: `(Optional[dict])`
             mapping from uid to number of negative samples before downsampling
+        correct_bias (via config): when True, apply stratified downsampling correction with
+            kept-batch pos/neg ratio s (not positive fraction):
+            if p <= 1/2, positives use 1 - p^2/(1-p) and negatives use -p*s;
+            otherwise positives use 1-p and negatives use -(1-p)*s.
 
     Note:
         If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
@@ -346,9 +380,24 @@ def compute_grpo_outcome_advantage(
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
+    id2s = {}
+
+    correct_bias = config.get("correct_bias", False) if config is not None else False
+    positive_threshold = config.get("positive_threshold", 0.7) if config is not None else 0.7
 
     with torch.no_grad():
         bsz = scores.shape[0]
+
+        if correct_bias:
+            uid_pos_neg = defaultdict(lambda: [0, 0])
+            for i in range(bsz):
+                uid = index[i]
+                if scores[i].item() > positive_threshold:
+                    uid_pos_neg[uid][0] += 1
+                else:
+                    uid_pos_neg[uid][1] += 1
+            for uid, (n_pos, n_neg) in uid_pos_neg.items():
+                id2s[uid] = _grpo_kept_batch_pos_neg_ratio(n_pos, n_neg)
 
         # Compute statistics: use full distribution if available, otherwise use downsampled
         use_full_stats = (
@@ -363,7 +412,20 @@ def compute_grpo_outcome_advantage(
             _compute_with_local_stats()
 
         for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
+            uid = index[i]
+            if correct_bias:
+                p = id2mean[uid].item() if isinstance(id2mean[uid], torch.Tensor) else float(id2mean[uid])
+                s = id2s[uid]
+                r = scores[i].item()
+                adv_pos, adv_neg = _grpo_corrected_advantages(p, s)
+                if r > positive_threshold:
+                    scores[i] = adv_pos
+                else:
+                    scores[i] = adv_neg
+                if norm_adv_by_std_in_grpo:
+                    std = id2std[uid].item() if isinstance(id2std[uid], torch.Tensor) else float(id2std[uid])
+                    scores[i] = scores[i] / (std + epsilon)
+            elif norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]

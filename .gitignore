@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv
+venv/
+env/
+
+# Local data and experiment artifacts
+data/
+outputs/
+wandb/
+logs/
+checkpoints/
+*.log
+
+# Model/checkpoint binaries
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/

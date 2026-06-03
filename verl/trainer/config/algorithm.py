@@ -93,3 +93,5 @@ class AlgoConfig(BaseConfig):
     max_rounds: int = 4
     round_repeat: int = 8
     global_stat_est: bool = False
+    # Correct GRPO advantage for stratified downsampling (default off); see core_algos GRPO path
+    correct_bias: bool = False
