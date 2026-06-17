@@ -95,3 +95,4 @@ class AlgoConfig(BaseConfig):
     global_stat_est: bool = False
     # Correct GRPO advantage for stratified downsampling (default off); see core_algos GRPO path
     correct_bias: bool = False
+    diy_reweight: bool = False

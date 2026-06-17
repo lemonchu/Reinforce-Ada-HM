@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -383,6 +384,7 @@ def compute_grpo_outcome_advantage(
     id2s = {}
 
     correct_bias = config.get("correct_bias", False) if config is not None else False
+    diy_reweight = config.get("diy_reweight", False) if config is not None else False
     positive_threshold = config.get("positive_threshold", 0.7) if config is not None else 0.7
 
     with torch.no_grad():
@@ -429,6 +431,11 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+
+            if diy_reweight:
+                p = id2mean[uid].item() if isinstance(id2mean[uid], torch.Tensor) else float(id2mean[uid])
+                reweight = 4.0 if p <= 0.0625 else 1.0 / math.sqrt(max(p, epsilon))
+                scores[i] = scores[i] * reweight
 
         scores = scores.unsqueeze(-1) * response_mask
 
