@@ -20,11 +20,12 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import math
 import random
+import re
 import json
 import os
 import uuid
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -58,8 +59,10 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+import verl.utils.torch_functional as verl_F
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
@@ -74,6 +77,137 @@ from verl.trainer.ppo.reinforce_ada_utils import (
     validate_tensordict_performance,
     compute_seq_rewards_for_round,
 )
+
+DEFAULT_REFINE_INSTRUCTION = (
+    "Follow this instruction, carefully review your previous solution:\n"
+    "1. Go through each calculation step-by-step. Check if there are any errors in calculations, logic, or problem understanding.\n"
+    "2. If you find any mistakes, explicitly point out what was wrong and explain the correct approach.\n"
+    "3. If the solution is already correct, verify each step and explain it more clearly.\n"
+    "4. Finally, after finishing the review, provide your refined solution and answer.\n"
+)
+
+DEFAULT_REWRITE_INSTRUCTION = (
+    "Based on your previous solution and review, solve this problem again from scratch and write a complete, "
+    "self-contained solution. Your previous answer and your review will not be kept, so your final response must "
+    "stand alone and include all necessary reasoning. Keep the mathematical meaning and final answer unchanged, "
+    "but use a different presentation or reasoning path where possible. Write as if you are solving the problem "
+    "for the first time: do not mention the previous solution, the review, re-examining, verification, or that "
+    "the solution has no errors. Avoid meta-style openings or closings such as \"After re-examining the problem "
+    "and the calculations,\" or \"This method clearly shows all necessary steps and ensures that there are no "
+    "errors in the solution process.\" Put the final answer inside \\boxed{}."
+)
+
+
+def _rewrite_normalize_words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9]+|\\[A-Za-z]+|[+\-*/=^(){}\[\].,]", text.lower())
+
+
+def _rewrite_rouge_n_f1(reference: str, candidate: str, n: int = 1) -> float:
+    ref_tokens = _rewrite_normalize_words(reference)
+    cand_tokens = _rewrite_normalize_words(candidate)
+    if len(ref_tokens) < n or len(cand_tokens) < n:
+        return 0.0
+    ref_ngrams = Counter(tuple(ref_tokens[i : i + n]) for i in range(len(ref_tokens) - n + 1))
+    cand_ngrams = Counter(tuple(cand_tokens[i : i + n]) for i in range(len(cand_tokens) - n + 1))
+    overlap = sum((ref_ngrams & cand_ngrams).values())
+    if overlap == 0:
+        return 0.0
+    precision = overlap / max(sum(cand_ngrams.values()), 1)
+    recall = overlap / max(sum(ref_ngrams.values()), 1)
+    return 2 * precision * recall / max(precision + recall, 1e-12)
+
+
+def _rewrite_lcs_len(a: list[str], b: list[str]) -> int:
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    for x in a:
+        cur = [0]
+        for j, y in enumerate(b, start=1):
+            cur.append(prev[j - 1] + 1 if x == y else max(prev[j], cur[-1]))
+        prev = cur
+    return prev[-1]
+
+
+def _rewrite_rouge_l_f1(reference: str, candidate: str) -> float:
+    ref_tokens = _rewrite_normalize_words(reference)
+    cand_tokens = _rewrite_normalize_words(candidate)
+    if not ref_tokens or not cand_tokens:
+        return 0.0
+    lcs = _rewrite_lcs_len(ref_tokens, cand_tokens)
+    precision = lcs / len(cand_tokens)
+    recall = lcs / len(ref_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def _rewrite_soft_target_score(value: float, target: float, width: float) -> float:
+    width = max(width, 1e-6)
+    return math.exp(-((value - target) / width) ** 2)
+
+
+def _rewrite_length_score_piecewise(
+    rewrite_len: int,
+    reference_len: int,
+    refine_len: int,
+    width: float,
+    low_scale: float,
+    high_scale: float,
+) -> tuple[float, float, int, int]:
+    low_scale = max(low_scale, 1e-6)
+    high_scale = max(high_scale, low_scale)
+    low = max(1, round(min(reference_len, refine_len) * low_scale))
+    high = max(low, round(max(reference_len, refine_len) * high_scale))
+    if low <= rewrite_len <= high:
+        return 1.0, 1.0, low, high
+    len_ratio_to_band = rewrite_len / low if rewrite_len < low else high / max(rewrite_len, 1)
+    width = max(width, 1e-6)
+    score = math.exp(-(math.log(max(len_ratio_to_band, 1e-6)) / width) ** 2)
+    return score, len_ratio_to_band, low, high
+
+
+def _rewrite_composite_reward(
+    correct: bool,
+    reference: str,
+    refined: str,
+    rewrite: str,
+    rouge_target: float,
+    rouge_width: float,
+    length_width: float,
+    length_low_scale: float,
+    length_high_scale: float,
+) -> dict[str, float | int]:
+    rouge1 = _rewrite_rouge_n_f1(reference, rewrite, n=1)
+    rougel = _rewrite_rouge_l_f1(reference, rewrite)
+    rouge = 0.5 * rouge1 + 0.5 * rougel
+    rouge_score = _rewrite_soft_target_score(rouge, target=rouge_target, width=rouge_width)
+    reference_len = len(_rewrite_normalize_words(reference))
+    refine_len = len(_rewrite_normalize_words(refined))
+    rewrite_len = len(_rewrite_normalize_words(rewrite))
+    length_score, len_ratio_to_band, length_low, length_high = _rewrite_length_score_piecewise(
+        rewrite_len=rewrite_len,
+        reference_len=reference_len,
+        refine_len=refine_len,
+        width=length_width,
+        low_scale=length_low_scale,
+        high_scale=length_high_scale,
+    )
+    reward = float(correct) * rouge_score * length_score
+    return {
+        "reward": float(reward),
+        "rouge1_f": float(rouge1),
+        "rouge_l_f": float(rougel),
+        "rouge_mix": float(rouge),
+        "rouge_score": float(rouge_score),
+        "reference_len": reference_len,
+        "refine_len": refine_len,
+        "rewrite_len": rewrite_len,
+        "length_low": length_low,
+        "length_high": length_high,
+        "len_ratio_to_band": float(len_ratio_to_band),
+        "length_score": float(length_score),
+    }
 
 
 @dataclass
@@ -1220,6 +1354,1050 @@ class RayPPOTrainer:
 
         return final_batch, rounds_info
 
+    def _extract_last_user_message(self, raw_prompt) -> str:
+        if isinstance(raw_prompt, np.ndarray):
+            raw_prompt = raw_prompt.tolist()
+        if isinstance(raw_prompt, str):
+            return raw_prompt
+        if not isinstance(raw_prompt, list):
+            return ""
+
+        for message in reversed(raw_prompt):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        parts.append(item.get("text", ""))
+                    elif isinstance(item, str):
+                        parts.append(item)
+                return "".join(parts)
+            if isinstance(content, str):
+                return content
+            return str(content)
+        return ""
+
+    @staticmethod
+    def _extract_role_message(raw_prompt, role: str, first: bool = True) -> str:
+        if isinstance(raw_prompt, np.ndarray):
+            raw_prompt = raw_prompt.tolist()
+        if isinstance(raw_prompt, str):
+            return raw_prompt if role == "user" else ""
+        if not isinstance(raw_prompt, list):
+            return ""
+        messages = raw_prompt if first else list(reversed(raw_prompt))
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != role:
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        parts.append(item.get("text", ""))
+                    elif isinstance(item, str):
+                        parts.append(item)
+                return "".join(parts)
+            return content if isinstance(content, str) else str(content)
+        return ""
+
+    def _decode_response_text(self, batch: DataProto, row_idx: int) -> str:
+        response_ids = batch.batch["responses"][row_idx]
+        if "response_mask" in batch.batch.keys():
+            response_ids = response_ids[batch.batch["response_mask"][row_idx].bool()]
+        return self.tokenizer.decode(response_ids.tolist(), skip_special_tokens=True).strip()
+
+    def _select_refine_source_batch(self, final_batch: DataProto) -> tuple[Optional[DataProto], dict[str, float]]:
+        cfg = self.config.algorithm
+        mode = str(cfg.get("refine_selection_mode", "difficult_first"))
+        difficult_space = int(cfg.get("difficult_refine_space", 256) or 0)
+        positive_threshold = float(cfg.get("positive_threshold", 0.7))
+        seed = int(self.config.data.get("seed", 0) or 0) + int(self.global_steps)
+        rng = random.Random(seed)
+
+        if "uid" not in final_batch.non_tensor_batch:
+            return None, {"refine/source_prompts": 0}
+
+        reward_key = "token_level_scores" if "token_level_scores" in final_batch.batch.keys() else "token_level_rewards"
+        if reward_key not in final_batch.batch.keys():
+            return None, {"refine/source_prompts": 0}
+
+        seq_scores = final_batch.batch[reward_key].sum(dim=-1).detach().cpu().numpy()
+        uids = list(final_batch.non_tensor_batch["uid"])
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid_to_indices[uid].append(idx)
+
+        uid_order = list(uid_to_indices.keys())
+        uid_mean = {
+            uid: float(np.mean([seq_scores[idx] for idx in idxs])) for uid, idxs in uid_to_indices.items()
+        }
+        selected: list[int] = []
+        difficult_selected = 0
+        difficult_pos_selected = 0
+        difficult_zero_selected = 0
+
+        if mode in {"random", "uniform"}:
+            for uid in uid_order:
+                selected.append(rng.choice(uid_to_indices[uid]))
+        elif mode in {"difficult_first", "difficult", "hard_first"}:
+            sorted_uids = sorted(uid_order, key=lambda uid: (uid_mean[uid], uid))
+            difficult_uids = set(sorted_uids[: max(0, min(difficult_space, len(sorted_uids)))])
+            for uid in sorted_uids:
+                idxs = uid_to_indices[uid]
+                if uid in difficult_uids:
+                    pos = [idx for idx in idxs if seq_scores[idx] > positive_threshold]
+                    neg = [idx for idx in idxs if seq_scores[idx] <= positive_threshold]
+                    if pos:
+                        selected.append(rng.choice(pos))
+                        difficult_pos_selected += 1
+                    elif neg:
+                        selected.append(rng.choice(neg))
+                        difficult_zero_selected += 1
+                    else:
+                        selected.append(rng.choice(idxs))
+                    difficult_selected += 1
+                else:
+                    selected.append(rng.choice(idxs))
+        else:
+            raise ValueError(f"Unknown refine_selection_mode: {mode}")
+
+        if not selected:
+            return None, {"refine/source_prompts": 0}
+
+        source_batch = final_batch[selected]
+        metrics = {
+            "refine/source_prompts": len(selected),
+            "refine/difficult_space": min(difficult_space, len(uid_order)) if mode not in {"random", "uniform"} else 0,
+            "refine/difficult_selected": difficult_selected,
+            "refine/difficult_pos_selected": difficult_pos_selected,
+            "refine/difficult_zero_selected": difficult_zero_selected,
+            "refine/source_reward_mean": float(np.mean([seq_scores[idx] for idx in selected])),
+        }
+        return source_batch, metrics
+
+    def _summarize_prompt_success_by_uid(
+        self,
+        batch: DataProto,
+        positive_threshold: Optional[float] = None,
+        allowed_uids: Optional[set[str]] = None,
+    ) -> dict:
+        if "uid" not in batch.non_tensor_batch:
+            return {"num_prompts": 0, "hist": Counter(), "mean": 0.0}
+
+        reward_key = "token_level_scores" if "token_level_scores" in batch.batch.keys() else "token_level_rewards"
+        if reward_key not in batch.batch.keys():
+            return {"num_prompts": 0, "hist": Counter(), "mean": 0.0}
+
+        if positive_threshold is None:
+            positive_threshold = float(self.config.algorithm.get("positive_threshold", 0.7))
+
+        seq_scores = batch.batch[reward_key].sum(dim=-1).detach().cpu().numpy()
+        uid_to_scores: dict[str, list[float]] = defaultdict(list)
+        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+            uid_str = str(uid)
+            if allowed_uids is not None and uid_str not in allowed_uids:
+                continue
+            uid_to_scores[uid_str].append(float(seq_scores[idx]))
+
+        hist = Counter()
+        success_rates = []
+        uid_success: dict[str, tuple[int, int]] = {}
+        for uid, scores in uid_to_scores.items():
+            total = len(scores)
+            if total == 0:
+                continue
+            success = sum(score > positive_threshold for score in scores)
+            hist[(success, total)] += 1
+            success_rates.append(success / total)
+            uid_success[uid] = (success, total)
+
+        return {
+            "num_prompts": len(success_rates),
+            "hist": hist,
+            "mean": float(np.mean(success_rates)) if success_rates else 0.0,
+            "uid_success": uid_success,
+        }
+
+    @staticmethod
+    def _format_success_hist(hist: Counter) -> str:
+        if not hist:
+            return "empty"
+        return ", ".join(f"{success}/{total}:{count}" for (success, total), count in sorted(hist.items()))
+
+    @staticmethod
+    def _add_success_hist_metrics(metrics: dict, prefix: str, summary: dict) -> None:
+        metrics[f"{prefix}/prompts"] = summary["num_prompts"]
+        metrics[f"{prefix}/success_rate_mean"] = summary["mean"]
+        for (success, total), count in sorted(summary["hist"].items()):
+            metrics[f"{prefix}/prompts_with_{success}_of_{total}_success"] = count
+
+    @staticmethod
+    def _format_top_refine_rows(source_summary: dict, refine_summary: dict, limit: int = 10) -> list[str]:
+        source_by_uid = source_summary.get("uid_success", {})
+        refine_by_uid = refine_summary.get("uid_success", {})
+
+        def sort_key(item):
+            uid, (success, total) = item
+            rate = success / total if total else 0.0
+            return success, rate, str(uid)
+
+        rows = []
+        for rank, (uid, (src_success, src_total)) in enumerate(sorted(source_by_uid.items(), key=sort_key)[:limit], 1):
+            ref_success, ref_total = refine_by_uid.get(uid, (0, 0))
+            rows.append(f"  {rank:02d}. uid={uid} source={src_success}/{src_total} refine={ref_success}/{ref_total}")
+        return rows
+
+    @staticmethod
+    def _format_source_bucket_refine_rows(
+        source_summary: dict,
+        refine_summary: dict,
+        source_success: int,
+        source_total: int,
+        limit: int = 10,
+    ) -> list[str]:
+        source_by_uid = source_summary.get("uid_success", {})
+        refine_by_uid = refine_summary.get("uid_success", {})
+        bucket_items = [
+            (uid, src_pair)
+            for uid, src_pair in source_by_uid.items()
+            if src_pair == (source_success, source_total)
+        ]
+
+        def sort_key(item):
+            uid, _ = item
+            ref_success, ref_total = refine_by_uid.get(uid, (0, 0))
+            ref_rate = ref_success / ref_total if ref_total else 0.0
+            return -ref_success, -ref_rate, str(uid)
+
+        rows = []
+        for rank, (uid, (src_success, src_total)) in enumerate(sorted(bucket_items, key=sort_key)[:limit], 1):
+            ref_success, ref_total = refine_by_uid.get(uid, (0, 0))
+            rows.append(f"  {rank:02d}. uid={uid} source={src_success}/{src_total} refine={ref_success}/{ref_total}")
+        return rows
+
+    def _build_refine_gen_batch(self, source_batch: DataProto) -> DataProto:
+        raw_prompts = source_batch.non_tensor_batch.get("raw_prompt", None)
+        max_prompt_length = int(self.config.algorithm.get("refine_max_prompt_length", 0) or self.config.data.max_prompt_length)
+        truncation = str(self.config.algorithm.get("refine_truncation", self.config.data.truncation))
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        instruction = self.config.algorithm.get("refine_instruction", None) or DEFAULT_REFINE_INSTRUCTION
+
+        input_ids_list = []
+        attention_mask_list = []
+        raw_prompt_ids_list = []
+        refine_prompts = []
+
+        for i in range(len(source_batch)):
+            if raw_prompts is not None:
+                question = self._extract_last_user_message(raw_prompts[i])
+            else:
+                prompt_ids = source_batch.batch["prompts"][i]
+                prompt_ids = prompt_ids[source_batch.batch["prompts"][i] != self.tokenizer.pad_token_id]
+                question = self.tokenizer.decode(prompt_ids.tolist(), skip_special_tokens=True)
+
+            previous_answer = self._decode_response_text(source_batch, i)
+            messages = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": previous_answer},
+                {"role": "user", "content": instruction},
+            ]
+            raw_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs,
+            )
+            model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs["attention_mask"],
+                max_length=max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=truncation,
+            )
+            input_ids_list.append(input_ids[0])
+            attention_mask_list.append(attention_mask[0])
+            raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+            if len(raw_prompt_ids) > max_prompt_length:
+                if truncation == "left":
+                    raw_prompt_ids = raw_prompt_ids[-max_prompt_length:]
+                elif truncation == "right":
+                    raw_prompt_ids = raw_prompt_ids[:max_prompt_length]
+                elif truncation == "middle":
+                    left_half = max_prompt_length // 2
+                    raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-(max_prompt_length - left_half):]
+                elif truncation == "error":
+                    raise RuntimeError(f"Refine prompt length {len(raw_prompt_ids)} is longer than {max_prompt_length=}.")
+            raw_prompt_ids_list.append(raw_prompt_ids)
+            refine_prompts.append(messages)
+
+        attention_mask = torch.stack(attention_mask_list, dim=0)
+        tensors = {
+            "input_ids": torch.stack(input_ids_list, dim=0),
+            "attention_mask": attention_mask,
+            "position_ids": compute_position_id_with_mask(attention_mask),
+        }
+        non_tensors = {}
+        for key in ("data_source", "reward_model", "uid"):
+            if key in source_batch.non_tensor_batch:
+                non_tensors[key] = source_batch.non_tensor_batch[key]
+
+        extra_info = source_batch.non_tensor_batch.get("extra_info", np.array([{}] * len(source_batch), dtype=object))
+        updated_extra = []
+        for item in extra_info.tolist() if isinstance(extra_info, np.ndarray) else list(extra_info):
+            new_item = dict(item) if isinstance(item, dict) else {"value": item}
+            new_item["is_refine"] = True
+            updated_extra.append(new_item)
+        non_tensors["extra_info"] = np.array(updated_extra, dtype=object)
+        non_tensors["raw_prompt"] = np.array(refine_prompts, dtype=object)
+        non_tensors["raw_prompt_ids"] = np.array(raw_prompt_ids_list, dtype=object)
+
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=dict(source_batch.meta_info))
+
+    @staticmethod
+    def _token_scores_from_sequence_rewards_like(batch: DataProto, seq_rewards: list[float]) -> torch.Tensor:
+        token_scores = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        response_mask = batch.batch["response_mask"]
+        for i, reward in enumerate(seq_rewards):
+            valid = torch.nonzero(response_mask[i].bool(), as_tuple=False).flatten()
+            if len(valid) > 0:
+                token_scores[i, valid[-1]] = float(reward)
+        return token_scores
+
+    def _select_rewrite_source_batch(
+        self,
+        refine_batch: DataProto,
+        source_success_summary: dict,
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
+        cfg = self.config.algorithm
+        positive_threshold = float(cfg.get("positive_threshold", 0.7))
+        source_bsz = int(cfg.get("rewrite_source_bsz", 0) or self.config.data.train_batch_size)
+        difficult_space = int(cfg.get("difficult_rewrite_space", 128) or 0)
+        seed = int(self.config.data.get("seed", 0) or 0) + int(self.global_steps) + 9001
+        rng = random.Random(seed)
+
+        if "uid" not in refine_batch.non_tensor_batch or "token_level_scores" not in refine_batch.batch.keys():
+            return None, {"rewrite/source_refines": 0}
+
+        seq_scores = refine_batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
+        uid_to_correct: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(refine_batch.non_tensor_batch["uid"]):
+            if seq_scores[idx] > positive_threshold:
+                uid_to_correct[str(uid)].append(idx)
+
+        source_by_uid = source_success_summary.get("uid_success", {})
+        difficult_order = sorted(
+            source_by_uid.keys(),
+            key=lambda uid: (
+                source_by_uid[uid][0] / max(source_by_uid[uid][1], 1),
+                source_by_uid[uid][0],
+                str(uid),
+            ),
+        )
+
+        selected: list[int] = []
+        selected_set: set[int] = set()
+        difficult_selected = 0
+        for uid in difficult_order[: max(0, difficult_space)]:
+            candidates = [idx for idx in uid_to_correct.get(str(uid), []) if idx not in selected_set]
+            if not candidates:
+                continue
+            idx = rng.choice(candidates)
+            selected.append(idx)
+            selected_set.add(idx)
+            difficult_selected += 1
+            if len(selected) >= source_bsz:
+                break
+
+        if len(selected) < source_bsz:
+            remaining = [
+                idx
+                for indices in uid_to_correct.values()
+                for idx in indices
+                if idx not in selected_set
+            ]
+            rng.shuffle(remaining)
+            selected.extend(remaining[: source_bsz - len(selected)])
+
+        if not selected:
+            return None, {"rewrite/source_refines": 0}
+
+        selected_batch = refine_batch[selected]
+        metrics = {
+            "rewrite/source_refines": len(selected),
+            "rewrite/source_refines_available": sum(len(v) for v in uid_to_correct.values()),
+            "rewrite/difficult_space": difficult_space,
+            "rewrite/difficult_selected": difficult_selected,
+        }
+        return selected_batch, metrics
+
+    def _build_rewrite_gen_batch(self, source_batch: DataProto) -> DataProto:
+        raw_prompts = source_batch.non_tensor_batch.get("raw_prompt", None)
+        max_prompt_length = int(
+            self.config.algorithm.get("rewrite_max_prompt_length", 0)
+            or self.config.algorithm.get("refine_max_prompt_length", 0)
+            or self.config.data.max_prompt_length
+        )
+        truncation = str(self.config.algorithm.get("rewrite_truncation", self.config.data.truncation))
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        instruction = self.config.algorithm.get("rewrite_instruction", None) or DEFAULT_REWRITE_INSTRUCTION
+
+        input_ids_list = []
+        attention_mask_list = []
+        raw_prompt_ids_list = []
+        rewrite_prompts = []
+        rewrite_questions = []
+        rewrite_references = []
+        rewrite_refined = []
+
+        for i in range(len(source_batch)):
+            raw_prompt = raw_prompts[i] if raw_prompts is not None else ""
+            question = self._extract_role_message(raw_prompt, role="user", first=True)
+            previous_solution = self._extract_role_message(raw_prompt, role="assistant", first=True)
+            refined_solution = self._decode_response_text(source_batch, i)
+            content = (
+                "Your previous solution was:\n"
+                f"{previous_solution}\n\n"
+                "Your review/refined solution was:\n"
+                f"{refined_solution}\n\n"
+                f"{instruction}"
+            )
+            messages = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": refined_solution},
+                {"role": "user", "content": content},
+            ]
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs,
+            )
+            model_inputs = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+            input_ids, attention_mask = verl_F.postprocess_data(
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs["attention_mask"],
+                max_length=max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=truncation,
+            )
+            raw_prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+            if len(raw_prompt_ids) > max_prompt_length:
+                raw_prompt_ids = raw_prompt_ids[-max_prompt_length:] if truncation == "left" else raw_prompt_ids[:max_prompt_length]
+            input_ids_list.append(input_ids[0])
+            attention_mask_list.append(attention_mask[0])
+            raw_prompt_ids_list.append(raw_prompt_ids)
+            rewrite_prompts.append(messages)
+            rewrite_questions.append(question)
+            rewrite_references.append(refined_solution)
+            rewrite_refined.append(refined_solution)
+
+        attention_mask = torch.stack(attention_mask_list, dim=0)
+        tensors = {
+            "input_ids": torch.stack(input_ids_list, dim=0),
+            "attention_mask": attention_mask,
+            "position_ids": compute_position_id_with_mask(attention_mask),
+        }
+        non_tensors = {}
+        for key in ("data_source", "reward_model", "uid"):
+            if key in source_batch.non_tensor_batch:
+                non_tensors[key] = source_batch.non_tensor_batch[key]
+        non_tensors["raw_prompt"] = np.array(rewrite_prompts, dtype=object)
+        non_tensors["raw_prompt_ids"] = np.array(raw_prompt_ids_list, dtype=object)
+        non_tensors["rewrite_question"] = np.array(rewrite_questions, dtype=object)
+        non_tensors["rewrite_reference_text"] = np.array(rewrite_references, dtype=object)
+        non_tensors["rewrite_refined_text"] = np.array(rewrite_refined, dtype=object)
+        extra_info = source_batch.non_tensor_batch.get("extra_info", np.array([{}] * len(source_batch), dtype=object))
+        updated_extra = []
+        for item in extra_info.tolist() if isinstance(extra_info, np.ndarray) else list(extra_info):
+            new_item = dict(item) if isinstance(item, dict) else {"value": item}
+            new_item["is_rewrite"] = True
+            updated_extra.append(new_item)
+        non_tensors["extra_info"] = np.array(updated_extra, dtype=object)
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=dict(source_batch.meta_info))
+
+    def _build_synthetic_batch_from_rewrites(self, rewrite_batch: DataProto, indices: list[int]) -> Optional[DataProto]:
+        if not indices:
+            return None
+        selected = rewrite_batch[indices]
+        max_prompt_length = int(self.config.data.max_prompt_length)
+        max_response_length = int(self.config.data.max_response_length)
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+
+        prompt_ids_list = []
+        prompt_mask_list = []
+        response_ids_list = []
+        response_mask_list = []
+        raw_prompts = []
+        raw_prompt_ids = []
+
+        for i in range(len(selected)):
+            question = str(selected.non_tensor_batch.get("rewrite_question", [""] * len(selected))[i])
+            messages = [{"role": "user", "content": question}]
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_chat_template_kwargs,
+            )
+            model_inputs = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+            prompt_ids, prompt_mask = verl_F.postprocess_data(
+                input_ids=model_inputs["input_ids"],
+                attention_mask=model_inputs["attention_mask"],
+                max_length=max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=self.config.data.truncation,
+            )
+            resp = selected.batch["responses"][i]
+            resp_mask = selected.batch["response_mask"][i].bool()
+            resp = resp[resp_mask][:max_response_length]
+            padded_resp = torch.full((max_response_length,), self.tokenizer.pad_token_id, dtype=resp.dtype)
+            padded_resp_mask = torch.zeros((max_response_length,), dtype=prompt_mask.dtype)
+            if len(resp) > 0:
+                padded_resp[: len(resp)] = resp
+                padded_resp_mask[: len(resp)] = 1
+            prompt_ids_list.append(prompt_ids[0])
+            prompt_mask_list.append(prompt_mask[0])
+            response_ids_list.append(padded_resp)
+            response_mask_list.append(padded_resp_mask)
+            raw_prompts.append(messages)
+            encoded_prompt = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+            raw_prompt_ids.append(encoded_prompt[-max_prompt_length:])
+
+        prompts = torch.stack(prompt_ids_list, dim=0)
+        responses = torch.stack(response_ids_list, dim=0)
+        prompt_attention = torch.stack(prompt_mask_list, dim=0)
+        response_mask = torch.stack(response_mask_list, dim=0)
+        attention_mask = torch.cat([prompt_attention, response_mask], dim=-1)
+        tensors = {
+            "prompts": prompts,
+            "responses": responses,
+            "input_ids": torch.cat([prompts, responses], dim=-1),
+            "attention_mask": attention_mask,
+            "position_ids": compute_position_id_with_mask(attention_mask),
+            "response_mask": response_mask,
+        }
+        non_tensors = {}
+        for key in ("data_source", "reward_model", "uid"):
+            if key in selected.non_tensor_batch:
+                non_tensors[key] = selected.non_tensor_batch[key]
+        non_tensors["raw_prompt"] = np.array(raw_prompts, dtype=object)
+        non_tensors["raw_prompt_ids"] = np.array(raw_prompt_ids, dtype=object)
+        non_tensors["extra_info"] = np.array([{"is_synthetic_rewrite": True} for _ in range(len(selected))], dtype=object)
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=dict(selected.meta_info))
+
+    def _run_rewrite_steps(
+        self,
+        refine_batch: DataProto,
+        source_success_summary: dict,
+        epoch: int,
+        logger,
+        progress_bar,
+    ) -> bool:
+        if not self.config.algorithm.get("enable_rewrite", False):
+            return False
+        if not self.config.algorithm.get("enable_refine", False):
+            raise ValueError("algorithm.enable_rewrite=True requires algorithm.enable_refine=True")
+        if self.global_steps > self.total_training_steps:
+            return True
+
+        source_batch, rewrite_metrics = self._select_rewrite_source_batch(refine_batch, source_success_summary)
+        if source_batch is None or len(source_batch) == 0:
+            print("[Rewrite] No successful refine source selected; skip rewrite steps.")
+            return False
+
+        rewrite_repeat = int(self.config.algorithm.get("rewrite_per_prompt", 4) or 4)
+        source_original_len = len(source_batch)
+        world_size = self.actor_rollout_wg.world_size
+        if source_original_len * rewrite_repeat % world_size != 0:
+            padding_needed = 1
+            while (source_original_len + padding_needed) * rewrite_repeat % world_size != 0:
+                padding_needed += 1
+            padding_batch = source_batch[random.choices(range(source_original_len), k=padding_needed)]
+            source_batch = DataProto.concat([source_batch, padding_batch])
+            print(
+                f"[Rewrite] Padding source refines from {source_original_len} "
+                f"to {len(source_batch)} for repeat={rewrite_repeat}, dp_world_size={world_size}"
+            )
+
+        timing_raw = {}
+        metrics = dict(rewrite_metrics)
+        metrics.update(
+            {
+                "rewrite/source_refines_original": source_original_len,
+                "rewrite/source_refines_padded": len(source_batch),
+                "rewrite/source_refines_padding": len(source_batch) - source_original_len,
+            }
+        )
+        correct_flags: list[bool] = []
+        composite_rewards: list[float] = []
+        rewrite_batch = None
+
+        with marked_timer("step", timing_raw):
+            with marked_timer("rewrite_build_prompt", timing_raw, color="green"):
+                rewrite_prompt_batch = self._build_rewrite_gen_batch(source_batch)
+                gen_batch = self._get_gen_batch(rewrite_prompt_batch)
+                gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch = gen_batch.repeat(repeat_times=rewrite_repeat, interleave=True)
+
+            with marked_timer("rewrite_gen", timing_raw, color="red"):
+                gen_batch_output = (
+                    self.actor_rollout_wg.generate_sequences(gen_batch)
+                    if not self.async_rollout_mode
+                    else self.async_rollout_manager.generate_sequences(gen_batch)
+                )
+                timing_raw.update({f"rewrite/{k}": v for k, v in gen_batch_output.meta_info.get("timing", {}).items()})
+                gen_batch_output.meta_info.pop("timing", None)
+
+            rewrite_batch = rewrite_prompt_batch.repeat(repeat_times=rewrite_repeat, interleave=True)
+            rewrite_batch = rewrite_batch.union(gen_batch_output)
+            if "response_mask" not in rewrite_batch.batch.keys():
+                rewrite_batch.batch["response_mask"] = compute_response_mask(rewrite_batch)
+
+            if self.config.trainer.balance_batch:
+                world_size = self.actor_rollout_wg.world_size
+                batch_size = len(rewrite_batch)
+                if batch_size % world_size != 0:
+                    padding_needed = world_size - (batch_size % world_size)
+                    padding_batch = rewrite_batch[random.choices(range(batch_size), k=padding_needed)]
+                    rewrite_batch = DataProto.concat([rewrite_batch, padding_batch])
+                self._balance_batch(rewrite_batch, metrics=metrics, logging_prefix="rewrite_global_seqlen")
+            rewrite_batch.batch = rewrite_batch.batch.contiguous()
+            rewrite_batch.meta_info["global_token_num"] = torch.sum(rewrite_batch.batch["attention_mask"], dim=-1).tolist()
+
+            with marked_timer("rewrite_reward", timing_raw, color="yellow"):
+                correctness_tensor, reward_extra_infos_dict = compute_reward(rewrite_batch, self.reward_fn)
+
+            seq_correct_scores = correctness_tensor.sum(dim=-1).detach().cpu().numpy()
+            positive_threshold = float(self.config.algorithm.get("positive_threshold", 0.7))
+            references = rewrite_batch.non_tensor_batch.get("rewrite_reference_text", np.array([""] * len(rewrite_batch), dtype=object))
+            refined_texts = rewrite_batch.non_tensor_batch.get("rewrite_refined_text", references)
+            reward_infos = []
+            for i in range(len(rewrite_batch)):
+                rewrite_text = self._decode_response_text(rewrite_batch, i)
+                correct = bool(seq_correct_scores[i] > positive_threshold)
+                correct_flags.append(correct)
+                info = _rewrite_composite_reward(
+                    correct=correct,
+                    reference=str(references[i]),
+                    refined=str(refined_texts[i]),
+                    rewrite=rewrite_text,
+                    rouge_target=float(self.config.algorithm.get("rewrite_rouge_target", 0.50)),
+                    rouge_width=float(self.config.algorithm.get("rewrite_rouge_width", 0.20)),
+                    length_width=float(self.config.algorithm.get("rewrite_length_width", 0.75)),
+                    length_low_scale=float(self.config.algorithm.get("rewrite_length_low_scale", 0.40)),
+                    length_high_scale=float(self.config.algorithm.get("rewrite_length_high_scale", 1.50)),
+                )
+                reward_infos.append(info)
+                composite_rewards.append(float(info["reward"]))
+
+            rewrite_scores = self._token_scores_from_sequence_rewards_like(rewrite_batch, composite_rewards)
+            rewrite_batch.batch["token_level_scores"] = rewrite_scores
+            rewrite_batch.batch["token_level_rewards"] = rewrite_scores
+            if reward_extra_infos_dict:
+                rewrite_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+            metrics.update(
+                {
+                    "rewrite/trajectories": len(rewrite_batch),
+                    "rewrite/correct_rate": float(np.mean(correct_flags)) if correct_flags else 0.0,
+                    "rewrite/composite_reward_mean": float(np.mean(composite_rewards)) if composite_rewards else 0.0,
+                    "rewrite/composite_reward_max": float(np.max(composite_rewards)) if composite_rewards else 0.0,
+                    "rewrite/rouge_mix_mean": float(np.mean([x["rouge_mix"] for x in reward_infos])) if reward_infos else 0.0,
+                    "rewrite/length_score_mean": float(np.mean([x["length_score"] for x in reward_infos])) if reward_infos else 0.0,
+                }
+            )
+
+            with marked_timer("rewrite_old_log_prob", timing_raw, color="blue"):
+                old_log_prob = self.actor_rollout_wg.compute_log_prob(rewrite_batch)
+                entropys = old_log_prob.batch["entropys"]
+                entropy_agg = agg_loss(
+                    loss_mat=entropys,
+                    loss_mask=rewrite_batch.batch["response_mask"],
+                    loss_agg_mode=self.config.actor_rollout_ref.actor.loss_agg_mode,
+                )
+                metrics["rewrite/actor_entropy"] = entropy_agg.detach().item()
+                old_log_prob.batch.pop("entropys")
+                rewrite_batch = rewrite_batch.union(old_log_prob)
+
+            if self.use_reference_policy:
+                with marked_timer("rewrite_ref", timing_raw, color="olive"):
+                    ref_log_prob = (
+                        self.ref_policy_wg.compute_ref_log_prob(rewrite_batch)
+                        if not self.ref_in_actor
+                        else self.actor_rollout_wg.compute_ref_log_prob(rewrite_batch)
+                    )
+                    rewrite_batch = rewrite_batch.union(ref_log_prob)
+
+            with marked_timer("rewrite_adv", timing_raw, color="brown"):
+                rewrite_algo_config = OmegaConf.create(OmegaConf.to_container(self.config.algorithm, resolve=True))
+                rewrite_algo_config.global_stat_est = False
+                rewrite_algo_config.correct_bias = False
+                batch_for_adv = compute_advantage(
+                    rewrite_batch,
+                    adv_estimator=self.config.algorithm.adv_estimator,
+                    gamma=self.config.algorithm.gamma,
+                    lam=self.config.algorithm.lam,
+                    num_repeat=rewrite_repeat,
+                    norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                    config=rewrite_algo_config,
+                )
+                rewrite_batch = batch_for_adv
+
+            if self.config.trainer.critic_warmup <= self.global_steps:
+                with marked_timer("rewrite_update_actor", timing_raw, color="red"):
+                    rewrite_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                    actor_output = self.actor_rollout_wg.update_actor(rewrite_batch)
+                metrics.update({f"rewrite/{k}": v for k, v in reduce_metrics(actor_output.meta_info["metrics"]).items()})
+
+        is_last_step = self.global_steps >= self.total_training_steps
+        if (
+            self.val_reward_fn is not None
+            and self.config.trainer.test_freq > 0
+            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+        ):
+            with marked_timer("rewrite_testing", timing_raw, color="green"):
+                metrics.update(self._validate())
+
+        metrics.update(
+            {
+                "training/global_step": self.global_steps,
+                "training/epoch": epoch,
+                "training/is_refine_step": 0,
+                "training/is_rewrite_step": 1,
+                "training/is_synthetic_step": 0,
+            }
+        )
+        metrics.update({f"rewrite/{k}": v for k, v in compute_data_metrics(batch=rewrite_batch, use_critic=False).items()})
+        metrics.update({f"rewrite/{k}": v for k, v in compute_timing_metrics(batch=rewrite_batch, timing_raw=timing_raw).items()})
+        print(
+            f"[Rewrite] step={self.global_steps} source_refines={len(source_batch)} "
+            f"repeat={rewrite_repeat} trajectories={len(rewrite_batch)} "
+            f"correct_rate={metrics['rewrite/correct_rate']:.4f} "
+            f"reward_mean={metrics['rewrite/composite_reward_mean']:.4f}"
+        )
+        logger.log(data=metrics, step=self.global_steps)
+        progress_bar.update(1)
+        self.global_steps += 1
+
+        if self.global_steps > self.total_training_steps:
+            return True
+
+        correct_indices = [idx for idx, correct in enumerate(correct_flags) if correct]
+        synthetic_batch = self._build_synthetic_batch_from_rewrites(rewrite_batch, correct_indices)
+        if synthetic_batch is None or len(synthetic_batch) == 0:
+            print("[Synthetic-Rewrite] No correct rewrite samples; skip synthetic update.")
+            return False
+
+        synthetic_original_len = len(synthetic_batch)
+        world_size = self.actor_rollout_wg.world_size
+        if synthetic_original_len % world_size != 0:
+            padding_needed = world_size - (synthetic_original_len % world_size)
+            padding_batch = synthetic_batch[random.choices(range(synthetic_original_len), k=padding_needed)]
+            synthetic_batch = DataProto.concat([synthetic_batch, padding_batch])
+            print(
+                f"[Synthetic-Rewrite] Padding synthetic batch from {synthetic_original_len} "
+                f"to {len(synthetic_batch)} for dp_world_size={world_size}"
+            )
+
+        synth_timing = {}
+        synth_metrics = {
+            "synthetic_rewrite/source_correct_rewrites": len(correct_indices),
+            "synthetic_rewrite/original_trajectories": synthetic_original_len,
+            "synthetic_rewrite/trajectories": len(synthetic_batch),
+            "synthetic_rewrite/padding": len(synthetic_batch) - synthetic_original_len,
+        }
+        with marked_timer("step", synth_timing):
+            synthetic_batch.batch = synthetic_batch.batch.contiguous()
+            synthetic_batch.meta_info["global_token_num"] = torch.sum(synthetic_batch.batch["attention_mask"], dim=-1).tolist()
+            with marked_timer("synthetic_old_log_prob", synth_timing, color="blue"):
+                old_log_prob = self.actor_rollout_wg.compute_log_prob(synthetic_batch)
+                if "entropys" in old_log_prob.batch.keys():
+                    old_log_prob.batch.pop("entropys")
+                synthetic_batch = synthetic_batch.union(old_log_prob)
+
+            seq_rewards = [1.0] * len(synthetic_batch)
+            token_scores = self._token_scores_from_sequence_rewards_like(synthetic_batch, seq_rewards)
+            synthetic_batch.batch["token_level_scores"] = token_scores
+            synthetic_batch.batch["token_level_rewards"] = token_scores
+            synthetic_batch.batch["advantages"] = synthetic_batch.batch["response_mask"].float()
+            synthetic_batch.batch["returns"] = synthetic_batch.batch["advantages"]
+
+            with marked_timer("synthetic_update_actor", synth_timing, color="red"):
+                synthetic_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                actor_output = self.actor_rollout_wg.update_actor(synthetic_batch)
+            synth_metrics.update(
+                {f"synthetic_rewrite/{k}": v for k, v in reduce_metrics(actor_output.meta_info["metrics"]).items()}
+            )
+
+        is_last_step = self.global_steps >= self.total_training_steps
+        if (
+            self.val_reward_fn is not None
+            and self.config.trainer.test_freq > 0
+            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+        ):
+            with marked_timer("synthetic_testing", synth_timing, color="green"):
+                synth_metrics.update(self._validate())
+
+        synth_metrics.update(
+            {
+                "training/global_step": self.global_steps,
+                "training/epoch": epoch,
+                "training/is_refine_step": 0,
+                "training/is_rewrite_step": 0,
+                "training/is_synthetic_step": 1,
+            }
+        )
+        synth_metrics.update(
+            {f"synthetic_rewrite/{k}": v for k, v in compute_timing_metrics(batch=synthetic_batch, timing_raw=synth_timing).items()}
+        )
+        print(
+            f"[Synthetic-Rewrite] step={self.global_steps} trajectories={len(synthetic_batch)} "
+            f"source_correct_rewrites={len(correct_indices)}"
+        )
+        debug_text = self._decode_response_text(synthetic_batch, 0) if len(synthetic_batch) > 0 else ""
+        debug_rewrite_idx = correct_indices[0] if correct_indices else None
+        debug_reward_info = reward_infos[debug_rewrite_idx] if debug_rewrite_idx is not None else {}
+        debug_correct = correct_flags[debug_rewrite_idx] if debug_rewrite_idx is not None else False
+        debug_ground_truth = ""
+        if len(synthetic_batch) > 0 and "reward_model" in synthetic_batch.non_tensor_batch:
+            reward_model_item = synthetic_batch.non_tensor_batch["reward_model"][0]
+            if isinstance(reward_model_item, dict):
+                debug_ground_truth = str(reward_model_item.get("ground_truth", ""))
+        print(
+            "[Synthetic-Rewrite-Debug-Sample] "
+            f"correct={debug_correct} "
+            "judge_scope=response_only "
+            f"reward={float(debug_reward_info.get('reward', 0.0)):.4f} "
+            f"rouge_mix={float(debug_reward_info.get('rouge_mix', 0.0)):.4f} "
+            f"rouge_score={float(debug_reward_info.get('rouge_score', 0.0)):.4f} "
+            f"length_score={float(debug_reward_info.get('length_score', 0.0)):.4f} "
+            f"rewrite_len={int(debug_reward_info.get('rewrite_len', 0))} "
+            f"ground_truth={debug_ground_truth}"
+            f"\n{debug_text[:2000]}"
+        )
+        logger.log(data=synth_metrics, step=self.global_steps)
+        progress_bar.update(1)
+        self.global_steps += 1
+        return self.global_steps > self.total_training_steps
+
+    def _run_refine_step(self, source_final_batch: DataProto, epoch: int, logger, progress_bar) -> bool:
+        if self.global_steps > self.total_training_steps:
+            return False
+
+        source_batch, refine_metrics = self._select_refine_source_batch(source_final_batch)
+        if source_batch is None or len(source_batch) == 0:
+            print("[Refine] No source batch selected; skip refine step.")
+            return False
+
+        metrics = dict(refine_metrics)
+        source_uids = {str(uid) for uid in source_batch.non_tensor_batch.get("uid", [])}
+        source_success_summary = self._summarize_prompt_success_by_uid(
+            source_final_batch,
+            allowed_uids=source_uids,
+        )
+        self._add_success_hist_metrics(metrics, "refine/source_prompt_success", source_success_summary)
+        timing_raw = {}
+        is_last_step = self.global_steps >= self.total_training_steps
+        refine_repeat = int(self.config.algorithm.get("refine_per_prompt", 4) or 4)
+        refine_success_summary = {"num_prompts": 0, "hist": Counter(), "mean": 0.0}
+
+        with marked_timer("step", timing_raw):
+            with marked_timer("refine_build_prompt", timing_raw, color="green"):
+                refine_prompt_batch = self._build_refine_gen_batch(source_batch)
+                gen_batch = self._get_gen_batch(refine_prompt_batch)
+                gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch = gen_batch.repeat(repeat_times=refine_repeat, interleave=True)
+
+            with marked_timer("refine_gen", timing_raw, color="red"):
+                if not self.async_rollout_mode:
+                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                else:
+                    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                timing_raw.update({f"refine/{k}": v for k, v in gen_batch_output.meta_info.get("timing", {}).items()})
+                gen_batch_output.meta_info.pop("timing", None)
+
+            batch = refine_prompt_batch.repeat(repeat_times=refine_repeat, interleave=True)
+            batch = batch.union(gen_batch_output)
+
+            if "response_mask" not in batch.batch.keys():
+                batch.batch["response_mask"] = compute_response_mask(batch)
+
+            if self.config.trainer.balance_batch:
+                world_size = self.actor_rollout_wg.world_size
+                batch_size = len(batch)
+                if batch_size % world_size != 0:
+                    padding_needed = world_size - (batch_size % world_size)
+                    padding_batch = batch[random.choices(range(batch_size), k=padding_needed)]
+                    batch = DataProto.concat([batch, padding_batch])
+                self._balance_batch(batch, metrics=metrics)
+            batch.batch = batch.batch.contiguous()
+            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+            with marked_timer("refine_reward", timing_raw, color="yellow"):
+                if self.use_rm and "rm_scores" not in batch.batch.keys():
+                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                    batch = batch.union(reward_tensor)
+                if self.config.reward_model.launch_reward_fn_async:
+                    future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                else:
+                    reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+            with marked_timer("refine_old_log_prob", timing_raw, color="blue"):
+                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                entropys = old_log_prob.batch["entropys"]
+                entropy_agg = agg_loss(
+                    loss_mat=entropys,
+                    loss_mask=batch.batch["response_mask"],
+                    loss_agg_mode=self.config.actor_rollout_ref.actor.loss_agg_mode,
+                )
+                metrics["refine/actor_entropy"] = entropy_agg.detach().item()
+                old_log_prob.batch.pop("entropys")
+                batch = batch.union(old_log_prob)
+
+            if self.use_reference_policy:
+                with marked_timer("refine_ref", timing_raw, color="olive"):
+                    if not self.ref_in_actor:
+                        ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                    else:
+                        ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                    batch = batch.union(ref_log_prob)
+
+            if self.use_critic:
+                with marked_timer("refine_values", timing_raw, color="cyan"):
+                    values = self.critic_wg.compute_values(batch)
+                    batch = batch.union(values)
+
+            with marked_timer("refine_adv", timing_raw, color="brown"):
+                if self.config.reward_model.launch_reward_fn_async:
+                    reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                batch.batch["token_level_scores"] = reward_tensor
+                if reward_extra_infos_dict:
+                    batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                refine_success_summary = self._summarize_prompt_success_by_uid(batch)
+                self._add_success_hist_metrics(metrics, "refine/result_prompt_success", refine_success_summary)
+
+                if self.config.algorithm.use_kl_in_reward:
+                    batch, kl_metrics = apply_kl_penalty(
+                        batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                    )
+                    metrics.update({f"refine/{k}": v for k, v in kl_metrics.items()})
+                else:
+                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                refine_algo_config = OmegaConf.create(OmegaConf.to_container(self.config.algorithm, resolve=True))
+                refine_algo_config.global_stat_est = False
+                refine_algo_config.correct_bias = False
+                batch = compute_advantage(
+                    batch,
+                    adv_estimator=self.config.algorithm.adv_estimator,
+                    gamma=self.config.algorithm.gamma,
+                    lam=self.config.algorithm.lam,
+                    num_repeat=refine_repeat,
+                    norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                    config=refine_algo_config,
+                )
+
+            if self.use_critic:
+                with marked_timer("refine_update_critic", timing_raw, color="pink"):
+                    critic_output = self.critic_wg.update_critic(batch)
+                metrics.update({f"refine/{k}": v for k, v in reduce_metrics(critic_output.meta_info["metrics"]).items()})
+
+            if self.config.trainer.critic_warmup <= self.global_steps:
+                with marked_timer("refine_update_actor", timing_raw, color="red"):
+                    batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                    actor_output = self.actor_rollout_wg.update_actor(batch)
+                metrics.update({f"refine/{k}": v for k, v in reduce_metrics(actor_output.meta_info["metrics"]).items()})
+
+        if (
+            self.val_reward_fn is not None
+            and self.config.trainer.test_freq > 0
+            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+        ):
+            with marked_timer("refine_testing", timing_raw, color="green"):
+                metrics.update(self._validate())
+
+        esi_close_to_expiration = should_save_ckpt_esi(
+            max_steps_duration=self.max_steps_duration,
+            redundant_time=self.config.trainer.esi_redundant_time,
+        )
+        if self.config.trainer.save_freq > 0 and (
+            is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+        ):
+            with marked_timer("refine_save_checkpoint", timing_raw, color="green"):
+                self._save_checkpoint()
+
+        steps_duration = timing_raw["step"]
+        self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+        metrics.update(
+            {
+                "training/global_step": self.global_steps,
+                "training/epoch": epoch,
+                "training/is_refine_step": 1,
+            }
+        )
+        metrics.update({f"refine/{k}": v for k, v in compute_data_metrics(batch=batch, use_critic=self.use_critic).items()})
+        metrics.update({f"refine/{k}": v for k, v in compute_timing_metrics(batch=batch, timing_raw=timing_raw).items()})
+        metrics.update(
+            {
+                f"refine/{k}": v
+                for k, v in compute_throughout_metrics(
+                    batch=batch, timing_raw=timing_raw, n_gpus=self.resource_pool_manager.get_n_gpus()
+                ).items()
+            }
+        )
+
+        print(
+            f"[Refine] step={self.global_steps} source_prompts={len(source_batch)} "
+            f"repeat={refine_repeat} trajectories={len(batch)}"
+        )
+        print(
+            f"[Refine-Source] prompts={source_success_summary['num_prompts']} "
+            f"success_mean={source_success_summary['mean']:.4f} "
+            f"success_hist={self._format_success_hist(source_success_summary['hist'])}"
+        )
+        print(
+            f"[Refine-Result] prompts={refine_success_summary['num_prompts']} "
+            f"refine_per_prompt={refine_repeat} "
+            f"success_mean={refine_success_summary['mean']:.4f} "
+            f"success_hist={self._format_success_hist(refine_success_summary['hist'])}"
+        )
+        print("[Refine-Top10-Hardest]")
+        top_refine_rows = self._format_top_refine_rows(source_success_summary, refine_success_summary, limit=10)
+        for row in top_refine_rows:
+            print(row)
+        if not top_refine_rows:
+            print("  empty")
+        print("[Refine-Top10-Source-1of4]")
+        one_of_four_rows = self._format_source_bucket_refine_rows(
+            source_success_summary,
+            refine_success_summary,
+            source_success=1,
+            source_total=4,
+            limit=10,
+        )
+        for row in one_of_four_rows:
+            print(row)
+        if not one_of_four_rows:
+            print("  empty")
+        logger.log(data=metrics, step=self.global_steps)
+        progress_bar.update(1)
+        self.global_steps += 1
+        if (
+            self.config.algorithm.get("enable_rewrite", False)
+            and self.global_steps <= self.total_training_steps
+        ):
+            stop_after_rewrite = self._run_rewrite_steps(batch, source_success_summary, epoch, logger, progress_bar)
+            return is_last_step or stop_after_rewrite
+        return is_last_step
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1606,6 +2784,7 @@ class RayPPOTrainer:
                     {
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
+                        "training/is_refine_step": 0,
                     }
                 )
                 # collect metrics
@@ -1622,6 +2801,9 @@ class RayPPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
+                if self.config.algorithm.get("enable_refine", False):
+                    self._last_final_batch = batch
+
                 progress_bar.update(1)
                 self.global_steps += 1
 
@@ -1637,6 +2819,18 @@ class RayPPOTrainer:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
+
+                if (
+                    self.config.algorithm.get("enable_refine", False)
+                    and hasattr(self, "_last_final_batch")
+                    and self._last_final_batch is not None
+                    and self.global_steps <= self.total_training_steps
+                ):
+                    stop_after_refine = self._run_refine_step(self._last_final_batch, epoch, logger, progress_bar)
+                    self._last_final_batch = None
+                    if stop_after_refine:
+                        progress_bar.close()
+                        return
 
                 # this is experimental and may be changed/removed in the future
                 # in favor of a general-purpose data buffer pool

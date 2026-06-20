@@ -93,6 +93,23 @@ algorithm:
   global_stat_est: False
   correct_bias: False
   diy_reweight: False
+  enable_refine: False
+  refine_per_prompt: 4
+  refine_selection_mode: "difficult_first"
+  difficult_refine_space: 256
+  refine_max_prompt_length: 0
+  refine_truncation: "left"
+  enable_rewrite: False
+  rewrite_per_prompt: 4
+  difficult_rewrite_space: 128
+  rewrite_source_bsz: 0
+  rewrite_max_prompt_length: 0
+  rewrite_truncation: "left"
+  rewrite_rouge_target: 0.50
+  rewrite_rouge_width: 0.20
+  rewrite_length_width: 0.75
+  rewrite_length_low_scale: 0.40
+  rewrite_length_high_scale: 1.50
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False

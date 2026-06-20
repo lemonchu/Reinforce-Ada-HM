@@ -96,3 +96,22 @@ class AlgoConfig(BaseConfig):
     # Correct GRPO advantage for stratified downsampling (default off); see core_algos GRPO path
     correct_bias: bool = False
     diy_reweight: bool = False
+    enable_refine: bool = False
+    refine_per_prompt: int = 4
+    refine_selection_mode: str = "difficult_first"
+    difficult_refine_space: int = 256
+    refine_max_prompt_length: int = 0
+    refine_truncation: str = "left"
+    refine_instruction: Optional[str] = None
+    enable_rewrite: bool = False
+    rewrite_per_prompt: int = 4
+    difficult_rewrite_space: int = 128
+    rewrite_source_bsz: int = 0
+    rewrite_max_prompt_length: int = 0
+    rewrite_truncation: str = "left"
+    rewrite_instruction: Optional[str] = None
+    rewrite_rouge_target: float = 0.50
+    rewrite_rouge_width: float = 0.20
+    rewrite_length_width: float = 0.75
+    rewrite_length_low_scale: float = 0.40
+    rewrite_length_high_scale: float = 1.50
