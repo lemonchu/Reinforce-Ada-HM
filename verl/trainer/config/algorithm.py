@@ -115,3 +115,8 @@ class AlgoConfig(BaseConfig):
     rewrite_length_width: float = 0.75
     rewrite_length_low_scale: float = 0.40
     rewrite_length_high_scale: float = 1.50
+    # Reward-ablation knob: which factors multiply into the rewrite reward.
+    # Subset of ["correctness", "length", "rouge"]; empty list -> reward 1.0.
+    rewrite_reward_components: list[str] = field(
+        default_factory=lambda: ["correctness", "length", "rouge"]
+    )

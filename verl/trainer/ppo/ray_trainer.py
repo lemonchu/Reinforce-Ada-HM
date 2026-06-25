@@ -177,6 +177,7 @@ def _rewrite_composite_reward(
     length_width: float,
     length_low_scale: float,
     length_high_scale: float,
+    components=("correctness", "length", "rouge"),
 ) -> dict[str, float | int]:
     rouge1 = _rewrite_rouge_n_f1(reference, rewrite, n=1)
     rougel = _rewrite_rouge_l_f1(reference, rewrite)
@@ -193,7 +194,16 @@ def _rewrite_composite_reward(
         low_scale=length_low_scale,
         high_scale=length_high_scale,
     )
-    reward = float(correct) * rouge_score * length_score
+    # Ablation control: reward is the product of only the selected factors,
+    # starting from a base of 1.0 (so an empty `components` yields reward 1.0).
+    comps = {str(c).strip().lower() for c in components}
+    reward = 1.0
+    if "correctness" in comps:
+        reward *= float(correct)
+    if "length" in comps:
+        reward *= length_score
+    if "rouge" in comps:
+        reward *= rouge_score
     return {
         "reward": float(reward),
         "rouge1_f": float(rouge1),
@@ -1993,6 +2003,9 @@ class RayPPOTrainer:
                     length_width=float(self.config.algorithm.get("rewrite_length_width", 0.75)),
                     length_low_scale=float(self.config.algorithm.get("rewrite_length_low_scale", 0.40)),
                     length_high_scale=float(self.config.algorithm.get("rewrite_length_high_scale", 1.50)),
+                    components=self.config.algorithm.get(
+                        "rewrite_reward_components", ["correctness", "length", "rouge"]
+                    ),
                 )
                 reward_infos.append(info)
                 composite_rewards.append(float(info["reward"]))

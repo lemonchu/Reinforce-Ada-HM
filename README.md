@@ -179,6 +179,118 @@ You only need to run the following reformating command for verl training.
   | ```meta-llama/Llama-3.2-3B-Instruct``` | hard | Reinforce-Ada-balance | [```RLHFlow/reinforce_ada_hard_prompt_llama```](https://huggingface.co/datasets/RLHFlow/reinforce_ada_hard_prompt_llama) | [```RLHFlow/Llama-3.2-3B-Instruct-Reinforce-Ada-balance-hard```](https://huggingface.co/RLHFlow/Llama-3.2-3B-Instruct-Reinforce-Ada-balance-hard)
 
 
+---
+
+## 🔧 HM Fork: Environment, Data & Reward Ablation (PSC Bridges-2)
+
+This section documents additions in the `lemonchu/Reinforce-Ada-HM` fork:
+- Automated environment build script for PSC Bridges-2
+- One-command data download (no generation needed)
+- Configurable rewrite reward via `rewrite_reward_components`
+- SLURM sbatch ablation scripts
+
+### Environment Setup (PSC Bridges-2)
+
+> Requires a GPU compute node (H100 recommended). Do **not** run on the login node.
+
+```bash
+# 1. Get an interactive H100 node (builds flash-attn from source)
+interact -p GPU-shared --gres=gpu:h100-80:1 -t 08:00:00
+
+# 2. Build the full environment (torch 2.7.1+cu126, flash-attn, vllm 0.10.1)
+cd /path/to/Reinforce-Ada-HM
+bash scripts/build_env.sh
+
+# Resume from a specific step if interrupted (e.g. step 7 = flash-attn):
+bash scripts/build_env.sh 7
+
+# 3. Activate in any future session / sbatch job:
+module load cuda/12.4.0 gcc/10.2.0
+source ~/.venvs/reinforce_ada/bin/activate
+```
+
+> **Package manager:** always `uv`. Never `pip` or `conda` directly.
+
+### Data Download
+
+Instead of generating data from scratch (which requires a large GPU job), download
+the pre-processed RLHFlow prompt sets directly from HuggingFace:
+
+```bash
+# Activate env first
+source ~/.venvs/reinforce_ada/bin/activate
+
+# Download hard prompts (default) → data/openr1/{train,test}.parquet
+bash scripts/download_data.sh
+
+# Download easy prompts instead
+LEVEL=easy bash scripts/download_data.sh
+```
+
+The script:
+- Downloads `RLHFlow/reinforce_ada_hard_prompt_1-5b` (or `simple` for easy)
+- Reformats into verl parquet via `data_process.reformat` + `data_process.get_validation_set`
+- Stores data on Ocean (`/ocean/projects/cis250185p/tming/reinforce-ada/data/openr1/`) and symlinks `./data/openr1` to it
+
+> **Note:** The HuggingFace README display text (e.g. `..._1.5b`, "easy") does not match the actual repo IDs. The script uses the correct IDs (`1-5b` with a dash; "simple" not "easy").
+
+### New Scripts
+
+| Script | Purpose |
+|---|---|
+| `scripts/build_env.sh` | Build the full Python env on PSC Bridges-2 (resumable by step) |
+| `scripts/download_data.sh` | Download + reformat pre-processed prompt sets from HuggingFace |
+| `scripts/reward-ablation/_train_reward_ablation.sh` | Shared training launcher for reward ablation runs; all hyperparams live here |
+| `scripts/reward-ablation/ablation_correct.sbatch` | Ablation 1/3 — rewrite reward = `correctness` only |
+| `scripts/reward-ablation/ablation_correct_length.sbatch` | Ablation 2/3 — rewrite reward = `correctness × length` |
+| `scripts/reward-ablation/ablation_correct_length_rouge.sbatch` | Ablation 3/3 — rewrite reward = `correctness × length × ROUGE` (full default) |
+
+### Rewrite Reward Ablation
+
+The rewrite stage reward is now configurable via `algorithm.rewrite_reward_components` (a list of `correctness`, `length`, `rouge`). The final reward is the product of the selected components (default 1.0 if empty).
+
+**Code changes:**
+- `verl/trainer/config/algorithm.py` — added `rewrite_reward_components: list[str]`
+- `verl/trainer/config/ppo_trainer.yaml` — added default `["correctness", "length", "rouge"]`
+- `verl/trainer/ppo/ray_trainer.py` — `_rewrite_composite_reward()` now accepts a `components` param
+
+### Launching Experiments
+
+Submit an ablation job via sbatch, passing key hyperparams as env vars:
+
+```bash
+sbatch \
+  --gres=gpu:h100-80:4 \
+  --cpus-per-task=48 \
+  --mem=480G \
+  --export=ALL,\
+NGPUS=4,\
+MODEL_PATH=/path/to/model,\
+MODEL_NAME=Qwen2.5-1.5B-Instruct,\
+TEMPERATURE=1.0,\
+REINFORCE_ADA_CHOICE=balanced,\
+REWARD_COMPONENTS=[correctness] \
+  scripts/reward-ablation/ablation_correct.sbatch
+```
+
+**Configurable env vars:**
+
+| Var | Default | Description |
+|---|---|---|
+| `MODEL_PATH` | `Qwen/Qwen2.5-1.5B-Instruct` | Local or HF model path |
+| `MODEL_NAME` | `Qwen2.5-1.5B-Instruct` | Used in exp name / output dir |
+| `NGPUS` | `4` | Number of GPUs per node |
+| `TEMPERATURE` | `1.0` | Rollout sampling temperature |
+| `REINFORCE_ADA_CHOICE` | `balanced` | `balanced` or `positive_focused` |
+| `REWARD_COMPONENTS` | `[correctness,length,rouge]` | Rewrite reward factors |
+
+Checkpoints are saved to:
+```
+/ocean/projects/cis250185p/tming/reinforce-ada/outputs/Reinforce-Ada/<exp_name>/
+```
+
+---
+
 ## 🙏 Acknowledgement
 We thank [verl](https://github.com/volcengine/verl) for providing the awesome training codebase, and [Qwen2.5-Math](https://github.com/QwenLM/Qwen2.5-Math) for its robust grader.
 

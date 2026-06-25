@@ -110,6 +110,9 @@ algorithm:
   rewrite_length_width: 0.75
   rewrite_length_low_scale: 0.40
   rewrite_length_high_scale: 1.50
+  # Reward-ablation knob: which factors multiply into the rewrite reward.
+  # Any subset of [correctness, length, rouge]; empty list -> reward 1.0.
+  rewrite_reward_components: ["correctness", "length", "rouge"]
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
